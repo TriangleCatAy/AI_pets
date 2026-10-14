@@ -75,7 +75,7 @@
 
 ### 发行版
 
-到 [Releases](https://github.com/AngleCatAy/AI_pets/releases) 下载 zip → 解压 → 双击 `DeepSeekPet.exe`。
+到 [Releases](https://github.com/TriangleCatAy/AI_pets/releases) 下载 zip → 解压 → 双击 `DeepSeekPet.exe`。
 
 第一次打开时角色会出现在桌面右下角。填 Key 的方法：
 
