@@ -132,7 +132,18 @@
         var el = els[i]
         if (!el.parentNode) continue
         if (el.style.display === 'none') continue
-        if (el.offsetWidth > 0 || el.offsetHeight > 0) return true
+        if (el.offsetWidth <= 0 && el.offsetHeight <= 0) continue
+        // 光"有尺寸"还不够：遮罩可能是**残留节点**——visibility:hidden 或完全
+        // 透明。这种节点既没真的在显示，也不该继续让整个透明窗口保持可交互
+        // （那会把桌面的点击一直吃掉）。要求"确实可见"才算模态打开。
+        try {
+          var cs = window.getComputedStyle(el)
+          if (cs) {
+            if (cs.display === 'none' || cs.visibility === 'hidden') continue
+            if (cs.opacity !== '' && Number(cs.opacity) === 0) continue
+          }
+        } catch (err) {}
+        return true
       }
     } catch (err) {}
     return false
@@ -234,6 +245,35 @@
     clickStart = null
     update(e.clientX, e.clientY)
   }, true)
+
+  // —— 左键"点了没反应"的自动判据：只来 pointerup、不来 pointerdown ——
+  // 正常一次左键点击必然 down → up 成对。若只收到 up 收不到 down，说明渲染进程
+  // 的鼠标状态卡在"左键已按下"：点击要 down 起手、拖拽要 down 起手，于是左键点击
+  // 与拖拽全废；右键的 down/up 完整所以照常，主进程驱动的自动冒泡也不受影响。
+  // （Windows 上窗口 hide() 后再 show() 会踩到这个状态，现在隐藏已改成销毁窗口，
+  // 见 pet/main.cjs 的 hideWindow。这条日志留作回归哨兵：万一以后又冒出来，
+  // data/pet.log 里会直接写明，不用再靠猜。）
+  var sawLeftDown = false
+  window.addEventListener('pointerdown', function (e) {
+    if (e.pointerType === 'mouse' && e.button !== 0) return
+    sawLeftDown = true
+  }, true)
+  window.addEventListener('pointerup', function (e) {
+    try {
+      var paired = sawLeftDown
+      sawLeftDown = false
+      if (paired || !host.clickDiag) return
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      if (!isWhaleHit(e.clientX, e.clientY)) return
+      host.clickDiag({
+        kind: 'ui',
+        detail: '左键状态异常：只收到 pointerup、没收到配对的 pointerdown' +
+          '（渲染进程鼠标状态卡在"左键已按下"的特征；左键点击/拖拽会全部失效）' +
+          '；坐标=' + Math.round(e.clientX) + ',' + Math.round(e.clientY),
+      })
+    } catch (err) {}
+  }, true)
+
   window.addEventListener('mousemove', function (e) { update(e.clientX, e.clientY) }, true)
 
   // 悬停到 <select>（或文件选择）上就提前把窗口切成可激活：原生下拉是鼠标

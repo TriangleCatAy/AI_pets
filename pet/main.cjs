@@ -239,9 +239,12 @@ function layout() {
   win.setBounds({ x: wa.x, y: wa.y, width: wa.width, height: wa.height })
 }
 
+// 注意：这个函数可以被**重复调用**（隐藏 = 销毁窗口，再显示 = 重建窗口，见
+// showWindow / hideWindow）。所以窗口事件回调里一律用局部 `w`，不要引用模块级
+// 的 `win`——否则旧窗口的残留回调会作用到新窗口上。
 function createWindow() {
   const wa = workArea()
-  win = new BrowserWindow({
+  const w = new BrowserWindow({
     x: wa.x,
     y: wa.y,
     width: wa.width,
@@ -267,34 +270,70 @@ function createWindow() {
       backgroundThrottling: false,
     },
   })
+  win = w
 
   // screen-saver 层级：浮在普通窗口之上，包括最大化窗口
-  win.setAlwaysOnTop(true, 'screen-saver')
-  win.setVisibleOnAllWorkspaces(true)
+  w.setAlwaysOnTop(true, 'screen-saver')
+  w.setVisibleOnAllWorkspaces(true)
   // 初始整窗穿透，鼠标移到鲸鱼像素上时由页内适配器再打开
-  win.setIgnoreMouseEvents(true, { forward: true })
+  w.setIgnoreMouseEvents(true, { forward: true })
   clickThrough = true
 
-  win.once('ready-to-show', () => {
-    win.showInactive()
+  w.once('ready-to-show', () => {
+    w.showInactive()
     log('窗口已显示', JSON.stringify(wa))
   })
   // 启动时把当前光标位置交给页面：否则如果光标本来就在鲸鱼上，适配器要等到
   // 用户动一下鼠标才把它切成可交互，那之前鲸鱼点不动，看起来像坏了
-  win.webContents.on('did-finish-load', () => {
+  w.webContents.on('did-finish-load', () => {
     try {
       const pt = screen.getCursorScreenPoint()
       const area = workArea()
-      win.webContents.send('pet:initial-cursor', { x: pt.x - area.x, y: pt.y - area.y })
+      w.webContents.send('pet:initial-cursor', { x: pt.x - area.x, y: pt.y - area.y })
     } catch (err) {}
     // 挂件菜单里那两行桌宠设置的当前值只有主进程知道，加载完推给它
     pushPetSettings()
   })
-  win.on('closed', () => {
-    win = null
+  w.on('closed', () => {
+    if (win === w) win = null
   })
 
-  win.loadURL(BASE + '/pet').catch((err) => log('加载页面失败', err.message))
+  w.loadURL(BASE + '/pet').catch((err) => log('加载页面失败', err.message))
+}
+
+// ---------------------------------------------------------------------------
+// 显示 / 隐藏
+//
+// 「隐藏」**不能**用 win.hide()。Windows 上隐藏再显示后，渲染进程的鼠标状态会
+// 卡在"左键已按下"：此后页面只收得到左键的 pointerup / mouseup，收不到
+// pointerdown / mousedown——而点击要成对、拖拽要 down 起手，于是左键点击、拖拽
+// 全废；右键的 down/up 完整所以正常，主进程驱动的自动冒泡也不受影响。
+// 同时 setIgnoreMouseEvents(true, {forward:true}) 的鼠标移动转发也在 hide/show
+// 后失效（页面再收不到 mousemove，光标也不变手型）。
+// 实测有效的做法：隐藏 = 销毁窗口，再显示 = 重新创建窗口（等价于重启，但主进程
+// 里的服务、托盘、自动冒泡定时器都保留）。销毁后 window-all-closed 会触发，见
+// 底部的处理——那里**不能**再 app.quit()，否则隐藏会连托盘一起把应用退掉。
+// ---------------------------------------------------------------------------
+
+function showWindow() {
+  if (win && !win.isDestroyed()) {
+    win.showInactive()
+    return
+  }
+  log('显示桌宠：重建窗口')
+  createWindow()
+}
+
+function hideWindow() {
+  if (!win || win.isDestroyed()) return
+  log('隐藏桌宠：销毁窗口（规避 Windows 上 hide 后左键状态卡死）')
+  win.destroy()
+  win = null
+}
+
+function toggleWindowVisible() {
+  if (win && !win.isDestroyed() && win.isVisible()) hideWindow()
+  else showWindow()
 }
 
 // 桌宠默认尺寸：只在还没有任何尺寸记录时写一次。
@@ -344,12 +383,9 @@ function createTray() {
   // 不再提供"打开设置菜单"的捷径——那会变成第二条入口。
   tray.setContextMenu(Menu.buildFromTemplate([
     {
+      // 隐藏走"销毁窗口"而不是 win.hide()——原因见 showWindow / hideWindow
       label: '显示 / 隐藏',
-      click: () => {
-        if (!win) return
-        if (win.isVisible()) win.hide()
-        else win.showInactive()
-      },
+      click: () => toggleWindowVisible(),
     },
     { type: 'separator' },
     { label: '打开配置文件', click: () => shell.openPath(CONFIG_PATH) },
@@ -579,9 +615,7 @@ ipcMain.on('pet:balance', (event, text) => {
 if (!app.requestSingleInstanceLock()) {
   app.quit()
 } else {
-  app.on('second-instance', () => {
-    if (win && !win.isDestroyed()) win.showInactive()
-  })
+  app.on('second-instance', () => showWindow())
 
   app
     .whenReady()
@@ -617,12 +651,26 @@ if (!app.requestSingleInstanceLock()) {
       }
     })
 
-  app.on('window-all-closed', () => app.quit())
+  // 隐藏桌宠 = 销毁窗口（见 hideWindow），所以窗口全关掉**不代表**要退出应用：
+  // 托盘还得留着，否则一隐藏就把桌宠连托盘一起退了。退出只走托盘「退出桌宠」。
+  app.on('window-all-closed', () => {
+    // 托盘是唯一的退出通道。万一托盘没建起来（图标加载失败），这里再留一条退路，
+    // 否则会变成一个"没有窗口、也没托盘、退不掉"的幽灵进程。
+    if (!tray) {
+      log('窗口已全部关闭且没有托盘，退出')
+      app.quit()
+      return
+    }
+    log('窗口已全部关闭（隐藏态）；保留托盘，不退出')
+  })
 }
 
-// 渲染进程崩了要留痕，否则透明窗口里什么都看不见
+// 渲染进程崩了要留痕，否则透明窗口里什么都看不见。
+// 注意：隐藏态下窗口是销毁过的，别把旧窗口的崩溃回调作用到新窗口上。
 app.on('render-process-gone', (event, contents, details) => {
   log('渲染进程退出：' + JSON.stringify(details))
+  if (!win || win.isDestroyed()) return
+  if (contents && win.webContents && contents.id !== win.webContents.id) return
   if (details && details.reason !== 'clean-exit') {
     setTimeout(() => {
       if (win && !win.isDestroyed()) win.reload()
